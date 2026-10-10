@@ -6,9 +6,13 @@ Behavior:
 - If no crawler exists → creates a new Glue database + crawler, then starts it.
 
 Naming convention:
-  prefix "library-data/" → DB "project_library_data_db", crawler "project-library-data-crawler"
-  prefix "cars-data/"    → DB "project_cars_data_db",    crawler "project-cars-data-crawler"
-  prefix "sales/"        → DB "project_sales_db",        crawler "project-sales-crawler"
+  The two KNOWN prefixes are pinned to the CloudFormation-managed names
+  (CFN is the single source of truth), and the Lambda STARTS the existing
+  CFN crawler rather than creating a duplicate database/crawler:
+    prefix "library-data/" → DB "project_library_db", crawler "project-library-crawler"
+    prefix "cars-data/"    → DB "project_cars_db",    crawler "project-cars-crawler"
+  UNKNOWN prefixes keep the generic sanitize-based behavior (create on demand):
+    prefix "sales/"        → DB "project_sales_db",   crawler "project-sales-crawler"
 """
 
 import json
@@ -24,6 +28,16 @@ logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 glue = boto3.client("glue")
+
+# The two prefixes provisioned by CloudFormation. CFN owns these crawlers and
+# databases, so we must reuse its exact names instead of deriving our own via
+# _sanitize_name — otherwise the Lambda would create duplicate catalogs
+# (project_cars_data_db / project-cars-data-crawler) alongside the CFN ones
+# (project_cars_db / project-cars-crawler). Map: prefix -> (db_name, crawler_name).
+KNOWN_PREFIXES = {
+    "cars-data": ("project_cars_db", "project-cars-crawler"),
+    "library-data": ("project_library_db", "project-library-crawler"),
+}
 
 # Environment variables set by CloudFormation
 CRAWLER_ROLE_ARN = os.environ["CRAWLER_ROLE_ARN"]
@@ -120,23 +134,41 @@ def handler(event, context):
 
         prefix = parts[0]
         s3_path = f"s3://{bucket}/{prefix}/"
-        crawler_name = _crawler_name(prefix)
-        db_name = _db_name(prefix)
+
+        # For the two CFN-managed prefixes, pin to the CloudFormation names and
+        # just START the existing crawler (no duplicate db/crawler creation).
+        # Unknown prefixes keep the generic sanitize-based create-then-start path.
+        known = KNOWN_PREFIXES.get(prefix)
+        if known is not None:
+            db_name, crawler_name = known
+        else:
+            crawler_name = _crawler_name(prefix)
+            db_name = _db_name(prefix)
 
         logger.info(
-            "Processing: bucket=%s prefix=%s crawler=%s db=%s",
-            bucket, prefix, crawler_name, db_name,
+            "Processing: bucket=%s prefix=%s crawler=%s db=%s known=%s",
+            bucket, prefix, crawler_name, db_name, known is not None,
         )
 
-        # Ensure database exists
+        if known is not None:
+            # CFN owns the crawler/database. Start it if present; only fall back
+            # to creating resources if the expected CFN crawler is missing.
+            if _crawler_exists(crawler_name):
+                _start_crawler(crawler_name)
+                continue
+            logger.warning(
+                "Expected CFN crawler %s not found — creating as a fallback.",
+                crawler_name,
+            )
+
+        # Generic path (unknown prefix, or known-prefix fallback):
+        # ensure database + crawler exist, then start.
         if not _database_exists(db_name):
             _create_database(db_name, f"Auto-created database for s3://{bucket}/{prefix}/")
 
-        # Ensure crawler exists
         if not _crawler_exists(crawler_name):
             _create_crawler(crawler_name, db_name, s3_path)
 
-        # Start the crawler
         _start_crawler(crawler_name)
 
     return {"statusCode": 200, "body": "OK"}

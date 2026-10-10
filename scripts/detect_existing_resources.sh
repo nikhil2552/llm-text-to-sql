@@ -21,7 +21,13 @@ else
   CREATE_PRIMARY="true"
 fi
 
-if resource_exists aws athena get-work-group --work-group "$ATHENA_WORKGROUP" --region "$REGION"; then
+# Reuse the Athena workgroup ONLY when it exists AND is still ENABLED. A
+# deleted workgroup lingers in the API with State=DELETED (and get-work-group
+# may fail); either case must report CREATE=true so the stack recreates it.
+# The `|| echo ''` keeps `set -e` happy when the workgroup is absent.
+WG_STATE="$(aws athena get-work-group --work-group "$ATHENA_WORKGROUP" --region "$REGION" \
+  --query 'WorkGroup.State' --output text 2>/dev/null || echo '')"
+if [[ "$WG_STATE" == "ENABLED" ]]; then
   CREATE_ATHENA="false"
 else
   CREATE_ATHENA="true"

@@ -16,7 +16,7 @@ REGION="${AWS_REGION:-eu-north-1}"
 IAM_USER="${IAM_USER:-$(aws iam get-user --query 'User.UserName' --output text 2>/dev/null || echo 'unknown')}"
 DESIRED_COUNT="${DESIRED_COUNT:-1}"
 STREAMLIT_DESIRED_COUNT="${STREAMLIT_DESIRED_COUNT:-1}"
-STREAMLIT_USERNAME="${STREAMLIT_USERNAME:-}"
+STREAMLIT_USERNAME="${STREAMLIT_USERNAME:-admin}"
 STREAMLIT_PASSWORD="${STREAMLIT_PASSWORD:-}"
 AUTO_MODE=false
 WITH_DATABASES=false
@@ -104,6 +104,14 @@ if $AUTO_MODE && [[ "$CHANGE_SET_TYPE" == "CREATE" ]]; then
   DEPLOY_STREAMLIT_DESIRED_COUNT="0"
 fi
 
+# Only create the Glue crawlers in --auto mode, where the deploy also seeds
+# data and runs the crawlers end-to-end. Review mode leaves them off so a
+# plain change set does not provision crawlers.
+CREATE_CRAWLERS_PARAM="false"
+if $AUTO_MODE; then
+  CREATE_CRAWLERS_PARAM="true"
+fi
+
 # ── CloudFormation parameters ─────────────────────────────────────────────
 CFN_PARAMETERS=$(cat <<EOF
 [
@@ -120,7 +128,7 @@ CFN_PARAMETERS=$(cat <<EOF
   {"ParameterKey": "CreateLibraryGlueDatabase", "ParameterValue": "${CREATE_LIBRARY_GLUE_DATABASE}"},
   {"ParameterKey": "CreateCarsGlueDatabase",    "ParameterValue": "${CREATE_CARS_GLUE_DATABASE}"},
   {"ParameterKey": "CreateAppLogGroup",         "ParameterValue": "${CREATE_APP_LOG_GROUP}"},
-  {"ParameterKey": "CreateCrawlers",            "ParameterValue": "false"}
+  {"ParameterKey": "CreateCrawlers",            "ParameterValue": "${CREATE_CRAWLERS_PARAM}"}
 ]
 EOF
 )
@@ -253,6 +261,15 @@ if $AUTO_MODE; then
       --region "$REGION"
   fi
   echo "✓ Stack $CHANGE_SET_TYPE complete"
+
+  echo ""
+  echo "=========================================="
+  echo "Seeding sample data into S3 (before crawlers run)..."
+  echo "=========================================="
+  # The bucket now exists; seed the datasets so the crawlers find data and
+  # register tables. A seed hiccup must never abort the deploy.
+  bash scripts/seed_s3_data.sh "$PRIMARY_DATA_BUCKET_NAME" \
+    || echo "⚠️  Data seeding skipped/failed — crawlers may find no data"
 
   echo ""
   echo "=========================================="
@@ -457,7 +474,8 @@ else
   echo "         --region $REGION"
   echo ""
   echo "    2. Wait for completion:"
-  echo "       aws cloudformation wait stack-${CHANGE_SET_TYPE,,}-complete \\"
+  CHANGE_SET_TYPE_LC="$(printf '%s' "$CHANGE_SET_TYPE" | tr '[:upper:]' '[:lower:]')"
+  echo "       aws cloudformation wait stack-${CHANGE_SET_TYPE_LC}-complete \\"
   echo "         --stack-name $STACK_NAME --region $REGION"
   echo ""
   echo "    3. Push image and start:"
