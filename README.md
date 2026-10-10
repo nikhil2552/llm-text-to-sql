@@ -113,7 +113,17 @@ cp .env.template .env   # then edit .env
 ## Part 2 — Deploy via GitHub CI/CD
 
 GitHub Actions builds the image and deploys ECS from your own repo and AWS account. No
-local Docker is required. The flow is five steps.
+local Docker is required. The flow is five steps, plus a verification check:
+
+```
+1. Open project          2. Sign in to          3. Create repo +
+   in your IDE      ──►      your GitHub    ──►      git push
+                                                         │
+                                                         ▼
+5. git push origin main  ◄── 4. ./deploy-changeset.sh --auto --with-cicd
+   (GitHub builds image,        (provisions AWS infra + OIDC, no local Docker)
+    pushes ECR, starts ECS)
+```
 
 ### Step 1 — open the project in your IDE
 Open this project folder in your IDE. Everything below runs from the project root.
@@ -172,6 +182,25 @@ aws secretsmanager get-secret-value \
   --secret-id cgs-ai-analyst-agent/streamlit-credentials \
   --region eu-north-1 --query SecretString --output text
 ```
+
+### Step 6 — verify it worked
+Once the Actions run finishes, grab the API URL from the workflow log (or from the stack
+output) and confirm the service is live:
+```bash
+# API URL from the CloudFormation stack output
+API_URL=$(aws cloudformation describe-stacks \
+  --stack-name cgs-ai-analyst-agent-project --region eu-north-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='LoadBalancerUrl'].OutputValue" --output text)
+
+# health check — expect {"status":"ok"}
+curl "$API_URL/health"
+
+# ask a question
+curl -X POST "$API_URL/query" -H 'Content-Type: application/json' \
+  -d '{"question": "How many books are there?"}'
+```
+Then open the **Streamlit URL** (stack output `StreamlitUrl`, port `8501`) in a browser and
+log in with `admin` and the password retrieved above.
 
 ### Add the optional databases
 Deploy Aurora + Redshift at the same time, or later:
