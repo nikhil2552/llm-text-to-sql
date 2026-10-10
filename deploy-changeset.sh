@@ -5,13 +5,21 @@
 #
 # Usage:
 #   ./deploy-changeset.sh                    # Review mode: creates change set, shows summary
-#   ./deploy-changeset.sh --auto             # Full auto: deploy stack + push image + seed data + start service
+#   ./deploy-changeset.sh --auto             # Full auto: deploy stack + build image locally + seed data + start service
 #   ./deploy-changeset.sh --auto --with-databases  # Also deploy RDS Aurora + Redshift Serverless
-#   ./deploy-changeset.sh --auto --with-cicd       # Also set up GitHub Actions OIDC (opt-in CI/CD)
+#   ./deploy-changeset.sh --auto --with-cicd       # GitHub Actions builds and pushes the image (no local Docker)
 #
 # The default --auto deploy is fully self-contained and touches NO GitHub:
-# infra + image + data seeding + crawlers + ECS start. GitHub Actions OIDC
-# setup is opt-in via --with-cicd for anyone wiring up push-to-deploy.
+# infra + locally built image + data seeding + crawlers + ECS start. It needs
+# Docker running locally.
+#
+# --with-cicd flips the image build to GitHub Actions: it provisions AWS infra,
+# seeds data, runs crawlers, and wires a GitHub OIDC role scoped to YOUR repo
+# (auto-detected from the `origin` git remote), but does NOT build the image
+# locally and does NOT need Docker. It requires an `origin` remote pointing at
+# your own GitHub repo; after it finishes, `git push origin main` triggers
+# .github/workflows/deploy.yml to build the image on GitHub, push it to ECR, and
+# start the ECS services.
 set -euo pipefail
 
 # ── Configuration ─────────────────────────────────────────────────────────
@@ -35,6 +43,55 @@ for arg in "$@"; do
     --with-cicd) WITH_CICD=true ;;
   esac
 done
+
+# ── Detect the GitHub owner/repo from the `origin` git remote ───────────────
+# Used by the --with-cicd path so the OIDC trust is scoped to YOUR repo instead
+# of a template default. Parses both HTTPS and SSH remote URLs, tolerates a
+# trailing slash and an optional `.git` suffix, and sets the globals
+# GITHUB_ORG / GITHUB_REPO. Returns non-zero (leaving them empty) when there is
+# no origin remote or it is not a GitHub URL. bash 3.2 compatible (no bash-4
+# case-folding expansions).
+GITHUB_ORG=""
+GITHUB_REPO=""
+detect_github_slug() {
+  GITHUB_ORG=""
+  GITHUB_REPO=""
+  local url
+  url="$(git remote get-url origin 2>/dev/null || git config --get remote.origin.url 2>/dev/null || echo '')"
+  if [[ -z "$url" ]]; then
+    return 1
+  fi
+  # Strip a trailing slash, then strip an optional trailing `.git`.
+  url="${url%/}"
+  url="${url%.git}"
+  local slug=""
+  case "$url" in
+    git@github.com:*)
+      slug="${url#git@github.com:}"
+      ;;
+    https://github.com/*)
+      slug="${url#https://github.com/}"
+      ;;
+    http://github.com/*)
+      slug="${url#http://github.com/}"
+      ;;
+    ssh://git@github.com/*)
+      slug="${url#ssh://git@github.com/}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  # slug should now be "OWNER/REPO" (REPO must not contain another slash).
+  local owner="${slug%%/*}"
+  local repo="${slug#*/}"
+  if [[ -z "$owner" || -z "$repo" || "$owner" == "$slug" || "$repo" == *"/"* ]]; then
+    return 1
+  fi
+  GITHUB_ORG="$owner"
+  GITHUB_REPO="$repo"
+  return 0
+}
 
 # Detect which data-layer resources already exist
 eval "$(bash scripts/detect_existing_resources.sh | grep -E '^[A-Z_]+=')"
@@ -278,11 +335,20 @@ if $AUTO_MODE; then
   bash scripts/seed_s3_data.sh "$PRIMARY_DATA_BUCKET_NAME" \
     || echo "⚠️  Data seeding skipped/failed — crawlers may find no data"
 
-  echo ""
-  echo "=========================================="
-  echo "Building and pushing container image..."
-  echo "=========================================="
-  DESIRED_COUNT="$DESIRED_COUNT" STREAMLIT_DESIRED_COUNT="$STREAMLIT_DESIRED_COUNT" ./scripts/push_ecr.sh
+  if $WITH_CICD; then
+    echo ""
+    echo "=========================================="
+    echo "Skipping local image build (CI/CD mode)..."
+    echo "=========================================="
+    echo "ℹ️  --with-cicd: the image is built and pushed by GitHub Actions (no local Docker)."
+    echo "    ECS stays at its current desired count until the GitHub build pushes an image."
+  else
+    echo ""
+    echo "=========================================="
+    echo "Building and pushing container image..."
+    echo "=========================================="
+    DESIRED_COUNT="$DESIRED_COUNT" STREAMLIT_DESIRED_COUNT="$STREAMLIT_DESIRED_COUNT" ./scripts/push_ecr.sh
+  fi
 
   echo ""
   echo "=========================================="
@@ -389,13 +455,35 @@ if $AUTO_MODE; then
   fi
 
   # ── GitHub Actions OIDC (opt-in CI/CD) ───────────────────────────────────
-  # Skipped by default. The core deploy is fully self-contained and does not
-  # need GitHub. Pass --with-cicd only when wiring up push-to-deploy.
+  # Pass --with-cicd when GitHub Actions should build and push the image (no
+  # local Docker). This provisions a GitHub OIDC role whose trust is scoped to
+  # YOUR repo, auto-detected from the `origin` git remote — never a hardcoded
+  # author repo. An origin remote pointing at your own GitHub repo is required.
   if $WITH_CICD; then
+    # Scope the OIDC trust to the repo you actually pushed to. If there is no
+    # origin remote (or it is not a GitHub URL), stop with actionable guidance
+    # — falling back to a default repo would mint a role that trusts someone
+    # else's repository. This gate runs on both CREATE and UPDATE paths.
+    if ! detect_github_slug; then
+      echo ""
+      echo "❌ --with-cicd requires an 'origin' remote pointing at your own GitHub repo."
+      echo ""
+      echo "   The CI/CD flow builds the image in GitHub Actions running in YOUR repo, so"
+      echo "   the OIDC role must be scoped to that repo. No GitHub 'origin' remote was found."
+      echo ""
+      echo "   Sign in to your own GitHub, create a new empty repo, then run:"
+      echo "     git remote add origin https://github.com/<you>/<repo>.git"
+      echo "     git branch -M main"
+      echo "     git push -u origin main"
+      echo "     ./deploy-changeset.sh --auto --with-cicd"
+      echo ""
+      exit 1
+    fi
     echo ""
     echo "=========================================="
     echo "Setting up GitHub Actions OIDC (CI/CD)..."
     echo "=========================================="
+    echo "Target GitHub repo (from origin remote): $GITHUB_ORG/$GITHUB_REPO"
     OIDC_STACK="github-actions-oidc"
     OIDC_STATUS="$(aws cloudformation describe-stacks \
       --stack-name "$OIDC_STACK" \
@@ -409,17 +497,21 @@ if $AUTO_MODE; then
         --query "OpenIDConnectProviderList[?ends_with(Arn, '/token.actions.githubusercontent.com')].Arn" \
         --output text 2>/dev/null || echo '')"
 
+      # Always scope the trust to the detected repo; only pass OIDCProviderArn
+      # when the account already has a GitHub OIDC provider to reuse.
+      OIDC_OVERRIDES=("GitHubOrg=$GITHUB_ORG" "GitHubRepo=$GITHUB_REPO")
+      if [[ -n "$EXISTING_OIDC" && "$EXISTING_OIDC" != "None" ]]; then
+        OIDC_OVERRIDES+=("OIDCProviderArn=$EXISTING_OIDC")
+      fi
+
       DEPLOY_OIDC_ARGS=(
         --template-file cloudformation-github-oidc.yml
         --stack-name "$OIDC_STACK"
         --capabilities CAPABILITY_NAMED_IAM
         --region "$REGION"
         --no-fail-on-empty-changeset
+        --parameter-overrides "${OIDC_OVERRIDES[@]}"
       )
-
-      if [[ -n "$EXISTING_OIDC" && "$EXISTING_OIDC" != "None" ]]; then
-        DEPLOY_OIDC_ARGS+=(--parameter-overrides "OIDCProviderArn=$EXISTING_OIDC")
-      fi
 
       aws cloudformation deploy "${DEPLOY_OIDC_ARGS[@]}" 2>/dev/null || echo "⚠️  OIDC stack deploy failed (non-blocking)"
 
@@ -432,16 +524,35 @@ if $AUTO_MODE; then
       if [[ -n "$ROLE_ARN" && "$ROLE_ARN" != "None" ]]; then
         echo "✓ GitHub OIDC role: $ROLE_ARN"
         if command -v gh &>/dev/null; then
-          gh secret set AWS_DEPLOY_ROLE_ARN --body "$ROLE_ARN" 2>/dev/null && \
-            echo "✓ GitHub secret AWS_DEPLOY_ROLE_ARN set" || \
-            echo "⚠️  Could not set GitHub secret (run: gh secret set AWS_DEPLOY_ROLE_ARN --body \"$ROLE_ARN\")"
+          gh secret set AWS_DEPLOY_ROLE_ARN --repo "$GITHUB_ORG/$GITHUB_REPO" --body "$ROLE_ARN" 2>/dev/null && \
+            echo "✓ GitHub secret AWS_DEPLOY_ROLE_ARN set on $GITHUB_ORG/$GITHUB_REPO" || \
+            echo "⚠️  Could not set GitHub secret (run: gh secret set AWS_DEPLOY_ROLE_ARN --repo \"$GITHUB_ORG/$GITHUB_REPO\" --body \"$ROLE_ARN\")"
         else
-          echo "  Set GitHub secret manually: gh secret set AWS_DEPLOY_ROLE_ARN --body \"$ROLE_ARN\""
+          echo "  Set GitHub secret manually: gh secret set AWS_DEPLOY_ROLE_ARN --repo \"$GITHUB_ORG/$GITHUB_REPO\" --body \"$ROLE_ARN\""
         fi
       fi
     else
       echo "✓ OIDC stack already exists ($OIDC_STATUS)"
     fi
+
+    # ── NEXT STEP: trigger the GitHub build ────────────────────────────────
+    # The image has NOT been built locally under --with-cicd. A push to main
+    # runs .github/workflows/deploy.yml, which builds on GitHub, pushes to ECR,
+    # and starts the ECS services. Print this on both CREATE and UPDATE paths.
+    echo ""
+    echo "=========================================="
+    echo "👉 NEXT STEP — trigger the GitHub build:"
+    echo "=========================================="
+    echo "   The image is NOT built locally in CI/CD mode. Push to GitHub to deploy:"
+    echo ""
+    echo "     git push origin main"
+    echo ""
+    echo "   This triggers .github/workflows/deploy.yml in $GITHUB_ORG/$GITHUB_REPO, which:"
+    echo "     • builds the Docker image on GitHub (linux/amd64)"
+    echo "     • pushes it to ECR"
+    echo "     • starts the ECS services (API + Streamlit)"
+    echo "   Watch progress under the repo's Actions tab; the workflow prints the API"
+    echo "   and Streamlit URLs when it finishes."
   else
     echo ""
     echo "ℹ️  Skipped GitHub Actions OIDC setup (CI/CD is opt-in)."
