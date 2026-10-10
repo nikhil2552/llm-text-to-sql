@@ -5,8 +5,13 @@
 #
 # Usage:
 #   ./deploy-changeset.sh                    # Review mode: creates change set, shows summary
-#   ./deploy-changeset.sh --auto             # Full auto: deploy stack + push image + start service
+#   ./deploy-changeset.sh --auto             # Full auto: deploy stack + push image + seed data + start service
 #   ./deploy-changeset.sh --auto --with-databases  # Also deploy RDS Aurora + Redshift Serverless
+#   ./deploy-changeset.sh --auto --with-cicd       # Also set up GitHub Actions OIDC (opt-in CI/CD)
+#
+# The default --auto deploy is fully self-contained and touches NO GitHub:
+# infra + image + data seeding + crawlers + ECS start. GitHub Actions OIDC
+# setup is opt-in via --with-cicd for anyone wiring up push-to-deploy.
 set -euo pipefail
 
 # ── Configuration ─────────────────────────────────────────────────────────
@@ -20,12 +25,14 @@ STREAMLIT_USERNAME="${STREAMLIT_USERNAME:-admin}"
 STREAMLIT_PASSWORD="${STREAMLIT_PASSWORD:-}"
 AUTO_MODE=false
 WITH_DATABASES=false
+WITH_CICD=false
 
 # Parse flags
 for arg in "$@"; do
   case "$arg" in
     --auto) AUTO_MODE=true ;;
     --with-databases) WITH_DATABASES=true ;;
+    --with-cicd) WITH_CICD=true ;;
   esac
 done
 
@@ -381,55 +388,64 @@ if $AUTO_MODE; then
     echo "  Redshift:     $REDSHIFT_ENDPOINT"
   fi
 
-  echo ""
-  echo "=========================================="
-  echo "Setting up GitHub Actions OIDC (CI/CD)..."
-  echo "=========================================="
-  OIDC_STACK="github-actions-oidc"
-  OIDC_STATUS="$(aws cloudformation describe-stacks \
-    --stack-name "$OIDC_STACK" \
-    --region "$REGION" \
-    --query 'Stacks[0].StackStatus' \
-    --output text 2>/dev/null || echo 'NOT_FOUND')"
-
-  if [[ "$OIDC_STATUS" == "NOT_FOUND" || "$OIDC_STATUS" == "DELETE_COMPLETE" ]]; then
-    # Check if OIDC provider already exists in account
-    EXISTING_OIDC="$(aws iam list-open-id-connect-providers \
-      --query "OpenIDConnectProviderList[?ends_with(Arn, '/token.actions.githubusercontent.com')].Arn" \
-      --output text 2>/dev/null || echo '')"
-
-    DEPLOY_OIDC_ARGS=(
-      --template-file cloudformation-github-oidc.yml
-      --stack-name "$OIDC_STACK"
-      --capabilities CAPABILITY_NAMED_IAM
-      --region "$REGION"
-      --no-fail-on-empty-changeset
-    )
-
-    if [[ -n "$EXISTING_OIDC" && "$EXISTING_OIDC" != "None" ]]; then
-      DEPLOY_OIDC_ARGS+=(--parameter-overrides "OIDCProviderArn=$EXISTING_OIDC")
-    fi
-
-    aws cloudformation deploy "${DEPLOY_OIDC_ARGS[@]}" 2>/dev/null || echo "⚠️  OIDC stack deploy failed (non-blocking)"
-
-    ROLE_ARN="$(aws cloudformation describe-stacks \
+  # ── GitHub Actions OIDC (opt-in CI/CD) ───────────────────────────────────
+  # Skipped by default. The core deploy is fully self-contained and does not
+  # need GitHub. Pass --with-cicd only when wiring up push-to-deploy.
+  if $WITH_CICD; then
+    echo ""
+    echo "=========================================="
+    echo "Setting up GitHub Actions OIDC (CI/CD)..."
+    echo "=========================================="
+    OIDC_STACK="github-actions-oidc"
+    OIDC_STATUS="$(aws cloudformation describe-stacks \
       --stack-name "$OIDC_STACK" \
       --region "$REGION" \
-      --query "Stacks[0].Outputs[?OutputKey=='DeployRoleArn'].OutputValue" \
-      --output text 2>/dev/null || echo '')"
+      --query 'Stacks[0].StackStatus' \
+      --output text 2>/dev/null || echo 'NOT_FOUND')"
 
-    if [[ -n "$ROLE_ARN" && "$ROLE_ARN" != "None" ]]; then
-      echo "✓ GitHub OIDC role: $ROLE_ARN"
-      if command -v gh &>/dev/null; then
-        gh secret set AWS_DEPLOY_ROLE_ARN --body "$ROLE_ARN" 2>/dev/null && \
-          echo "✓ GitHub secret AWS_DEPLOY_ROLE_ARN set" || \
-          echo "⚠️  Could not set GitHub secret (run: gh secret set AWS_DEPLOY_ROLE_ARN --body \"$ROLE_ARN\")"
-      else
-        echo "  Set GitHub secret manually: gh secret set AWS_DEPLOY_ROLE_ARN --body \"$ROLE_ARN\""
+    if [[ "$OIDC_STATUS" == "NOT_FOUND" || "$OIDC_STATUS" == "DELETE_COMPLETE" ]]; then
+      # Check if OIDC provider already exists in account
+      EXISTING_OIDC="$(aws iam list-open-id-connect-providers \
+        --query "OpenIDConnectProviderList[?ends_with(Arn, '/token.actions.githubusercontent.com')].Arn" \
+        --output text 2>/dev/null || echo '')"
+
+      DEPLOY_OIDC_ARGS=(
+        --template-file cloudformation-github-oidc.yml
+        --stack-name "$OIDC_STACK"
+        --capabilities CAPABILITY_NAMED_IAM
+        --region "$REGION"
+        --no-fail-on-empty-changeset
+      )
+
+      if [[ -n "$EXISTING_OIDC" && "$EXISTING_OIDC" != "None" ]]; then
+        DEPLOY_OIDC_ARGS+=(--parameter-overrides "OIDCProviderArn=$EXISTING_OIDC")
       fi
+
+      aws cloudformation deploy "${DEPLOY_OIDC_ARGS[@]}" 2>/dev/null || echo "⚠️  OIDC stack deploy failed (non-blocking)"
+
+      ROLE_ARN="$(aws cloudformation describe-stacks \
+        --stack-name "$OIDC_STACK" \
+        --region "$REGION" \
+        --query "Stacks[0].Outputs[?OutputKey=='DeployRoleArn'].OutputValue" \
+        --output text 2>/dev/null || echo '')"
+
+      if [[ -n "$ROLE_ARN" && "$ROLE_ARN" != "None" ]]; then
+        echo "✓ GitHub OIDC role: $ROLE_ARN"
+        if command -v gh &>/dev/null; then
+          gh secret set AWS_DEPLOY_ROLE_ARN --body "$ROLE_ARN" 2>/dev/null && \
+            echo "✓ GitHub secret AWS_DEPLOY_ROLE_ARN set" || \
+            echo "⚠️  Could not set GitHub secret (run: gh secret set AWS_DEPLOY_ROLE_ARN --body \"$ROLE_ARN\")"
+        else
+          echo "  Set GitHub secret manually: gh secret set AWS_DEPLOY_ROLE_ARN --body \"$ROLE_ARN\""
+        fi
+      fi
+    else
+      echo "✓ OIDC stack already exists ($OIDC_STATUS)"
     fi
   else
-    echo "✓ OIDC stack already exists ($OIDC_STATUS)"
+    echo ""
+    echo "ℹ️  Skipped GitHub Actions OIDC setup (CI/CD is opt-in)."
+    echo "    To enable push-to-deploy later, re-run with:  ./deploy-changeset.sh --auto --with-cicd"
   fi
 
   echo ""
@@ -453,7 +469,24 @@ if $AUTO_MODE; then
   fi
   if [[ -n "$STREAMLIT_URL" && "$STREAMLIT_URL" != "None" ]]; then
     echo "🖥️  Streamlit:   $STREAMLIT_URL"
+    echo "🔑 Streamlit login — username: ${STREAMLIT_USERNAME}  (get password with:)"
+    echo "     aws secretsmanager get-secret-value \\"
+    echo "       --secret-id cgs-ai-analyst-agent/streamlit-credentials \\"
+    echo "       --region $REGION --query SecretString --output text"
   fi
+
+  # ── Logical next steps: point to the follow-on scripts ───────────────────
+  echo ""
+  echo "── Optional next steps ──────────────────────────────────────────────"
+  if ! $WITH_DATABASES; then
+    echo "  • Add Aurora + Redshift databases:   ./deploy-changeset.sh --auto --with-databases"
+  fi
+  if ! $WITH_CICD; then
+    echo "  • Enable push-to-deploy (CI/CD):     ./deploy-changeset.sh --auto --with-cicd"
+  fi
+  echo "  • Rebuild/redeploy the image only:   ./scripts/push_ecr.sh"
+  echo "  • Tear everything down:              ./scripts/teardown.sh"
+  echo "─────────────────────────────────────────────────────────────────────"
 else
   # Review mode — show next steps
   echo ""

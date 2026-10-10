@@ -1,7 +1,41 @@
+git clone https://github.com/huraisturkey-lang/Ai_Agent.git
+cd Ai_Agent
+
+aws configure
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-dev.txt
+
+make prod-check
+
+./deploy-changeset.sh --auto
+
+aws secretsmanager get-secret-value \
+  --secret-id cgs-ai-analyst-agent/streamlit-credentials \
+  --region eu-north-1 --query SecretString --output text
+
+make teardown
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # Data Architecture with Generative AI (Text-to-SQL)
 
 Ask a question in plain English, get back an answer from your data. This service turns
-natural-language questions into SQL using **LangChain** + **AWS Bedrock** (Amazon Nova),
+natural-language questions into SQL using **AWS Bedrock** (Amazon Nova),
 runs the SQL safely (read-only), and returns the result. It ships as an HTTP API
 (FastAPI) and a chat UI (Streamlit), and runs on AWS ECS Fargate.
 
@@ -9,23 +43,22 @@ Supported data sources: **Athena, Redshift, RDS (PostgreSQL/MySQL), Snowflake, D
 
 ---
 
-## New here? Read this first
+## Deploy in one command
 
-There are **two completely separate ways** this project gets deployed. People confuse
-them, so here is the plain-English version:
+The entire stack deploys with a single command — fully automated, no GitHub required:
 
-| Path | What it does | Needs Docker on your laptop? |
-|------|--------------|------------------------------|
-| **A. Local script** — `./deploy-changeset.sh --auto` | Does *everything* from your machine: creates AWS infra, builds the Docker image **locally**, pushes it, starts ECS. | **Yes** |
-| **B. GitHub Actions** — `git push origin main` | GitHub's servers build the image and deploy. Triggered automatically on every push to `main`. | **No** |
+```bash
+./deploy-changeset.sh --auto
+```
 
-Important: these two do **not** call each other. The local script does *not* trigger the
-GitHub workflow. The GitHub workflow does *not* run the local script. Pick one path.
+This provisions all AWS infrastructure, builds and pushes the Docker image, seeds the
+sample data, catalogs it, and starts the services. The only prerequisites are **AWS
+credentials** and **Docker running locally**. See [Part 2](#part-2--deploy-to-aws) for the
+full breakdown.
 
-The one thing they share: before Path B can deploy, the AWS **infrastructure must already
-exist** (ECR repo + ECS service), because the GitHub workflow only *builds and updates* —
-it does not create the base stack. So a common first-time flow is "create infra once, then
-let GitHub handle every deploy after that."
+An optional GitHub Actions CI/CD path (push-to-deploy) is available for anyone who wants
+it, but it is entirely opt-in and never runs unless you ask for it — see
+[Part 4](#part-4--optional-cicd-via-github-actions).
 
 ---
 
@@ -38,8 +71,10 @@ Install these before you start:
    Verify with `aws sts get-caller-identity`.
 3. **Amazon Bedrock access** — enable the Amazon Nova models in the Bedrock console
    (region `eu-north-1`).
-4. **Docker Desktop** — *only if you use Path A (local build)*. Skip it for Path B.
-5. **(Optional) GitHub CLI `gh`** — handy for setting the deploy secret: `brew install gh`.
+4. **Docker Desktop** — required for the deploy (`--auto` builds the image locally).
+   Make sure it is running before you deploy.
+5. **(Optional) GitHub CLI `gh`** — only needed for the optional CI/CD path (Part 4):
+   `brew install gh`.
 
 ---
 
@@ -99,79 +134,59 @@ cp .env.template .env   # then edit .env
 
 ## Part 2 — Deploy to AWS
 
-### Choose your path
+One command deploys everything into AWS region `eu-north-1`. Make sure Docker Desktop is
+**running**, then:
 
-- **Path A** if you have Docker and want one command to do everything.
-- **Path B** if you don't want Docker locally and prefer deploys to happen on `git push`.
-
-Both deploy into AWS account region `eu-north-1`.
-
----
-
-### Path A — One command, builds locally (needs Docker)
-
-Make sure Docker Desktop is **running**, then:
 ```bash
 ./deploy-changeset.sh --auto
 ```
-This single command, in order:
-1. Creates/updates the main CloudFormation stack (VPC, ECS, ALB, Glue, S3, Lambda).
-2. Builds the Docker image **on your machine** (`linux/amd64`) and pushes it to ECR.
-3. Scales up the ECS services (API + Streamlit).
-4. Runs the Glue crawlers (registers the data tables).
-5. Configures the S3 → Lambda notification.
-6. Sets up the GitHub Actions OIDC role + secret (so Path B works later).
 
-When it finishes it prints your **API URL** and **Streamlit URL**.
+This runs end-to-end with no manual steps in between. In order it:
+1. Creates/updates the main CloudFormation stack (VPC, ECS, ALB, Glue, S3, Lambda), with
+   the Athena workgroup `project-text-to-sql` and the Glue crawlers both created automatically.
+2. Builds the Docker image on your machine (`linux/amd64`) and pushes it to ECR.
+3. **Seeds the sample data** — uploads `POC/data` to S3 (`s3_cars_data_normalized.csv` →
+   `cars-data/`, `s3_library_data.json` → `library-data/`) so the crawlers have data to catalog.
+4. Runs the Glue crawlers, registering `project_cars_db.cars_data` and
+   `project_library_db.library_data` so the query allowlist is populated.
+5. Scales up the ECS services (API + Streamlit). The Streamlit login username defaults to
+   `admin`; the password is auto-generated into the `cgs-ai-analyst-agent/streamlit-credentials`
+   Secrets Manager secret.
+6. Configures the S3 → Lambda notification.
 
-Add the optional databases (Aurora + Redshift) at the same time, or later:
+When it finishes it prints the **API URL**, **Streamlit URL**, and the exact command to
+retrieve the Streamlit password — you can query the sample data immediately. Data loading,
+cataloging, the Athena workgroup, and the UI login are all handled for you. The script also
+prints the logical next commands you can run (databases, CI/CD, redeploy, teardown).
+
+Retrieve the Streamlit password any time:
+```bash
+aws secretsmanager get-secret-value \
+  --secret-id cgs-ai-analyst-agent/streamlit-credentials \
+  --region eu-north-1 --query SecretString --output text
+```
+
+> Re-running `./deploy-changeset.sh --auto` is safe — the stack updates in place and the
+> data seed overwrites idempotently.
+
+### Add the optional databases
+
+Deploy Aurora + Redshift at the same time, or later:
 ```bash
 ./deploy-changeset.sh --auto --with-databases
 ```
-> Note the flag is `--with-databases` (not `--autodatabases`). Running the script a second
-> time is safe — the main stack updates in place, and the database stacks only deploy if
-> they don't already exist.
+Running the script again is safe — the main stack updates in place, and the database
+stacks only deploy if they don't already exist. See [Part 3](#part-3--optional-databases)
+for loading data into them.
 
----
+### Review before deploying (optional)
 
-### Path B — Deploy on push, builds on GitHub (no Docker)
-
-This is a two-time setup, then it's automatic forever.
-
-**B1. Create the AWS infrastructure once (no Docker needed).**
-The GitHub workflow can only build+update; it can't create the base stack. Create it in
-review mode (this only makes a change set — no image build):
+To inspect what will change without deploying anything, run the script with no flags. It
+creates a CloudFormation change set, prints a summary, and tells you the next command to
+run to execute it:
 ```bash
-./deploy-changeset.sh                 # prints an "execute-change-set" command
-# run the execute command it printed, then:
-aws cloudformation wait stack-create-complete \
-  --stack-name cgs-ai-analyst-agent-project --region eu-north-1
+./deploy-changeset.sh
 ```
-After this, the ECR repo and ECS services exist (ECS starts at 0 tasks — no image yet,
-which is expected).
-
-**B2. Wire up GitHub → AWS auth (once).**
-The deploy workflow logs into AWS using an OIDC role and a repo secret.
-```bash
-./scripts/setup-github-oidc.sh
-```
-This creates the IAM role and (if `gh` is installed and logged in) sets the repo secret
-`AWS_DEPLOY_ROLE_ARN`. If `gh` isn't available, the script prints the role ARN — add it
-manually at **Repo → Settings → Secrets and variables → Actions → New repository secret**:
-- Name: `AWS_DEPLOY_ROLE_ARN`
-- Value: the printed `arn:aws:iam::<account>:role/github-actions-deploy-role`
-
-**B3. Deploy by pushing.**
-```bash
-git push origin main
-```
-On every push to `main`, GitHub Actions (`.github/workflows/deploy.yml`):
-runs the test gate → builds the image on GitHub's servers → pushes to ECR → redeploys ECS →
-prints the URLs. Watch it under the repo's **Actions** tab.
-
-> First time only: your Git login must have **write access** to the repo. If `git push`
-> returns `403 / permission denied`, you're authenticated as the wrong GitHub account —
-> push from a plain terminal with a Personal Access Token for an account that owns the repo.
 
 ---
 
@@ -220,6 +235,38 @@ PYTHONPATH=src python scripts/run_query.py --question "How many books?" --json-o
 
 ---
 
+## Part 4 — Optional CI/CD via GitHub Actions
+
+This is **entirely optional**. The deploy in Part 2 is self-contained and never touches
+GitHub. Set this up only if you want a push-to-deploy workflow, where GitHub's servers
+build the image and redeploy on every push to `main` (no local Docker needed for those
+subsequent deploys).
+
+**Step 1 — set up the OIDC auth (opt-in).**
+Re-run the deploy with the `--with-cicd` flag. It provisions the GitHub Actions OIDC role
+and, if `gh` is installed and logged in, sets the repo secret `AWS_DEPLOY_ROLE_ARN`:
+```bash
+./deploy-changeset.sh --auto --with-cicd
+```
+If `gh` isn't available, the script prints the role ARN — add it manually at
+**Repo → Settings → Secrets and variables → Actions → New repository secret**:
+- Name: `AWS_DEPLOY_ROLE_ARN`
+- Value: the printed `arn:aws:iam::<account>:role/github-actions-deploy-role`
+
+> The OIDC role trust is scoped to a specific GitHub repo in
+> `cloudformation-github-oidc.yml` (`GitHubOrg` / `GitHubRepo` parameters). If you deploy
+> from your own fork, override those to match your repo.
+
+**Step 2 — deploy by pushing.**
+```bash
+git push origin main
+```
+On every push to `main`, `.github/workflows/deploy.yml` runs the test gate → builds the
+image on GitHub's servers → pushes to ECR → redeploys ECS → prints the URLs. Watch it under
+the repo's **Actions** tab.
+
+---
+
 ## Tear down
 
 Remove all AWS resources when you're done:
@@ -231,22 +278,27 @@ make teardown
 
 ## Troubleshooting
 
-- **`git push` → `403 denied to <account>`** — you're logged into GitHub as the wrong
-  account. Push from macOS Terminal.app with a Personal Access Token for an account that
-  owns the repo (editor terminals can inject a cached login).
-- **`fatal: 'origin' does not appear to be a git repository`** — the remote is missing.
-  Re-add it: `git remote add origin https://github.com/huraisturkey-lang/Ai_Agent.git`.
-- **GitHub deploy fails at "Configure AWS credentials"** — the `AWS_DEPLOY_ROLE_ARN` secret
-  is missing or the OIDC role doesn't exist. Do step **B2**.
-- **GitHub deploy fails on `ecs update-service` / ECR not found** — the base stack isn't
-  created yet. Do step **B1** first.
+- **Deploy fails because Docker isn't running** — `--auto` builds the image locally. Start
+  Docker Desktop and wait until it's ready, then re-run `./deploy-changeset.sh --auto`.
 - **Stack stuck in `REVIEW_IN_PROGRESS`** — a change set was created but never executed.
   Delete the empty stack and recreate: `aws cloudformation delete-stack --stack-name
-  cgs-ai-analyst-agent-project --region eu-north-1`, then redo Path A or B1.
+  cgs-ai-analyst-agent-project --region eu-north-1`, then re-run `./deploy-changeset.sh --auto`.
+- **Streamlit UI shows "Authentication not configured"** — the credentials secret has a
+  blank username. `--auto` sets it to `admin` automatically; if you deployed differently,
+  update the secret and restart the service (see
+  [DEPLOYMENT.md](DEPLOYMENT.md) for the exact commands).
+- **Query refused with "No allowed table list is configured"** — the Glue tables aren't
+  registered. Confirm the crawlers ran and the data was seeded (`--auto` does both). Check
+  `aws glue get-tables --database-name project_cars_db --region eu-north-1`.
+- **Query fails with "WorkGroup is not found"** — the `project-text-to-sql` Athena workgroup
+  is missing. `--auto` creates it; re-run the deploy to recreate it.
 - **`make smoke` import errors (`No module named boto3`)** — dependencies aren't installed
   in the active environment. Activate the venv and `pip install -r requirements-dev.txt`.
-- **Docker build fails on Apple Silicon** — ECS needs `linux/amd64`. Use the provided
-  scripts (`./scripts/push_ecr.sh`) which cross-build automatically.
+- **Docker build fails on Apple Silicon** — ECS needs `linux/amd64`. The provided scripts
+  (`./scripts/push_ecr.sh`) cross-build automatically.
+- **(Optional CI/CD) GitHub deploy fails at "Configure AWS credentials"** — the
+  `AWS_DEPLOY_ROLE_ARN` secret is missing or the OIDC role doesn't exist. Run
+  `./deploy-changeset.sh --auto --with-cicd` (Part 4).
 
 ---
 
@@ -268,7 +320,9 @@ Internet -> ALB:8501 -> Streamlit (ECS private subnet) -> Bedrock / Athena via V
 | `cgs-ai-rds-aurora` | `cloudformation-rds-aurora.yml` | Aurora Serverless v2 (MySQL) + Secrets Manager creds |
 | `cgs-ai-redshift-serverless` | `cloudformation-redshift-serverless.yml` | Redshift Serverless + Secrets Manager creds |
 
-### GitHub Actions workflows
+### GitHub Actions workflows (optional CI/CD — see Part 4)
+
+These run only if you opt into CI/CD. They are not needed for the Part 2 deploy.
 
 | Workflow | Trigger | What it does |
 |----------|---------|--------------|
@@ -284,10 +338,11 @@ Internet -> ALB:8501 -> Streamlit (ECS private subnet) -> Bedrock / Athena via V
 | `scripts/serve.py` | FastAPI server (ECS entrypoint) |
 | `scripts/streamlit_app.py` | Streamlit chat UI (`make ui`) |
 | `scripts/run_query.py` | CLI query tool (`--json-output`) |
-| `scripts/push_ecr.sh` | local build + push image + redeploy ECS |
-| `scripts/setup-github-oidc.sh` | set up GitHub Actions CI/CD auth |
+| `scripts/push_ecr.sh` | rebuild + push image + redeploy ECS |
+| `scripts/seed_s3_data.sh` | upload sample data to S3 (`cars-data/`, `library-data/`) |
+| `scripts/setup-github-oidc.sh` | set up GitHub Actions CI/CD auth (optional) |
 | `scripts/load_rds_data.py` | load sample data into Aurora |
-| `deploy-changeset.sh` | one-command local deploy (`--auto`, `--with-databases`) |
+| `deploy-changeset.sh` | one-command deploy (`--auto`; opt-in `--with-databases`, `--with-cicd`) |
 | `config/connections/*.yaml` | one file per data source (copy from `*.template`) |
 | `POC/` | sample data, smoke test, notebooks |
 | `.env.template` | environment variable template |
@@ -301,7 +356,7 @@ Set these as environment variables or in `.env` (copy from `.env.template`):
 
 | Variable | Required | Default | Notes |
 |----------|----------|---------|-------|
-| `APP_USERNAME` / `APP_PASSWORD` | Yes (UI) | — | Streamlit login; UI blocks without them |
+| `APP_USERNAME` / `APP_PASSWORD` | Yes (UI) | — | Streamlit login; UI blocks without them. On AWS, set automatically by `--auto` (username defaults to `admin`, password auto-generated into Secrets Manager) |
 | `GLUE_DB_NAME` / `GLUE_DB_NAMES` | Yes | `project_library_db` | single, or comma-separated list |
 | `PROJECT_FILES_BUCKET` | Yes | — | `langchain-<account-id>-eu-north-1` |
 | `ATHENA_WORKGROUP` | — | `primary` | use `project-text-to-sql` when deployed |
