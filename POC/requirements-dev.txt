@@ -1,0 +1,11 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Development and testing dependencies (not shipped in Docker)
+# ─────────────────────────────────────────────────────────────────────────────
+-r requirements.txt
+streamlit>=1.32.0,<2.0
+hypothesis>=6.0,<7.0
+
+# Optional connectors — install as needed:
+# pip install redshift-connector
+# pip install snowflake-connector-python
+# pip install databricks-sql-connector

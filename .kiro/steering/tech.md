@@ -9,8 +9,8 @@
 
 | Library | Purpose |
 |---------|---------|
-| langchain, langchain-community, langchain-experimental | LLM orchestration, text-to-SQL chains |
-| boto3 | AWS SDK (Glue, Bedrock, S3, Secrets Manager) |
+| boto3 | AWS SDK (Glue, Bedrock, S3, Secrets Manager) — text-to-SQL calls Bedrock directly |
+| langchain, langchain-community, langchain-experimental | Installed but **not used at runtime** (POC-only; see `POC/`) |
 | pyathena | Athena JDBC-style connector |
 | sqlalchemy | Database abstraction for RDS/Redshift/Snowflake |
 | fastapi + uvicorn | HTTP API server |

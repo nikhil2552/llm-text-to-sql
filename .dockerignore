@@ -18,4 +18,3 @@ DEPLOYMENT.md
 README.md
 deploy-changeset.sh
 cloudformation-*.yml
-run_smoke.py

@@ -1,55 +1,77 @@
-# Verification — Deployment Reliability Bug Fixes
+# Verification — GitHub CI/CD opt-in flow (`--with-cicd` builds on GitHub, no local Docker)
 
-Iteration: FIRST (no `review.json` present). All five fixes implemented per `plan.md`.
+Scope: `deploy-changeset.sh`, `README.md`. `cloudformation-github-oidc.yml` verified only
+(no change). No real AWS or GitHub calls were made.
 
-## What was changed
+## 1. Shell syntax check (`bash -n`)
 
-1. **Data seeding** — New `scripts/seed_s3_data.sh` (reusable, idempotent,
-   bash-3.2 safe). Uploads `POC/data/s3_cars_data_normalized.csv` → `cars-data/`
-   and `POC/data/s3_library_data.json` → `library-data/`, only if the local
-   files exist (warns otherwise, never aborts). Takes bucket as `$1` with
-   `PRIMARY_DATA_BUCKET_NAME` env fallback. Called from the `--auto` path of
-   `deploy-changeset.sh` immediately after "Stack complete" and before the
-   image push / crawler run. `scripts/setup.sh` stale commented upload lines
-   corrected to point at `POC/data/` with `cars-data/` and `library-data/`
-   prefixes and the normalized CSV.
-2. **Crawlers created** — `deploy-changeset.sh` now sets `CreateCrawlers` via
-   `CREATE_CRAWLERS_PARAM` (`true` under `--auto`, `false` in review mode).
-   Sequence: deploy (CreateCrawlers=true) → seed data → run crawlers. The
-   first-deploy `DesiredCount=0` CREATE logic is untouched.
-3. **Lambda duplicate catalog** — `lambda/s3_trigger_crawler/handler.py` adds a
-   `KNOWN_PREFIXES` map pinning `cars-data`→(`project_cars_db`,
-   `project-cars-crawler`) and `library-data`→(`project_library_db`,
-   `project-library-crawler`). For known prefixes it STARTs the existing CFN
-   crawler and skips create (fallback to create only if the CFN crawler is
-   missing). Unknown prefixes keep the generic `_sanitize_name` path unchanged.
-   Comments + docstring updated.
-4. **Athena workgroup detection** — `scripts/detect_existing_resources.sh` now
-   reports `CREATE_ATHENA=false` only when `get-work-group` returns
-   `WorkGroup.State == ENABLED`; missing/deleted → `true`. Template's
-   `ProjectAthenaWorkgroup` OutputLocation confirmed as
-   `s3://${PrimaryDataBucketName}/athenaresults/`.
-5. **Streamlit username** — `deploy-changeset.sh` defaults
-   `STREAMLIT_USERNAME` to `admin` when unset. Streamlit blank-credential
-   guard and `core.py` allowlist guard NOT touched.
+Command:
+```
+bash -n deploy-changeset.sh
+```
+Result: **PASS** — prints `SYNTAX_OK`, exit 0. Re-run after every edit; still passes.
 
-Also fixed the latent bash-4 `${CHANGE_SET_TYPE,,}` in the review-mode help
-string using `tr`-based lowercasing (bash-3.2 safe).
+## 2. Git-remote parse function — throwaway harness
 
-Template (`cloudformation-template-validated.yml`), `src/llm_sql/core.py`, and
-`scripts/streamlit_app.py` were NOT modified.
+A temporary harness (`/tmp/test_parse_slug.sh`) copied the `detect_github_slug` parse logic
+(parameterized to read the URL from `TEST_URL` instead of calling `git`) and asserted the
+expected owner/repo for each URL form, then asserted the fail-fast (empty/non-GitHub) cases.
 
-## Commands run (no AWS calls, no real deploy)
+Run under `bash 3.2.57(1)-release (arm64-apple-darwin26)`:
+```
+PASS  'https://github.com/acme/widgets.git'  -> owner=acme repo=widgets
+PASS  'https://github.com/acme/widgets'       -> owner=acme repo=widgets
+PASS  'git@github.com:acme/widgets.git'       -> owner=acme repo=widgets
+PASS  'https://github.com/acme/widgets/'      -> owner=acme repo=widgets   (trailing slash)
+PASS  'git@github.com:acme/widgets'           -> owner=acme repo=widgets
+PASS  'ssh://git@github.com/acme/widgets.git' -> owner=acme repo=widgets
+PASS  ''                                      -> correctly rejected (empty org/repo)
+PASS  'https://gitlab.com/acme/widgets.git'   -> correctly rejected (non-GitHub)
+ALL TESTS PASSED
+```
+The four required URL forms (HTTPS `.git`, HTTPS no-suffix, SSH `.git`, trailing-slash) all
+yield `owner=acme repo=widgets`; empty/non-GitHub input yields empty org/repo (the fail-fast
+case used by the `--with-cicd` gate). Harness **deleted** after it passed (`rm -f
+/tmp/test_parse_slug.sh`).
 
-- `make check` → `python3 -m compileall src scripts lambda POC/run_smoke.py` — **PASS** (exit 0)
-- `make prod-check` (check + test + smoke):
-  - unit tests: `Ran 127 tests ... OK`
-  - smoke: `python3 POC/run_smoke.py` — "Smoke test completed successfully."
-- `bash -n deploy-changeset.sh` — OK
-- `bash -n scripts/setup.sh` — OK
-- `bash -n scripts/detect_existing_resources.sh` — OK
-- `bash -n scripts/seed_s3_data.sh` — OK
-- `python3 -m py_compile lambda/s3_trigger_crawler/handler.py` — OK
-- Residual checks: `grep ',,}' deploy-changeset.sh` → none; `grep 'data/s3_cars_data.csv' scripts/setup.sh` → none.
+## 3. Anti-regression greps (no bash-4-isms, no hardcoded author repo)
 
-All verification passed. No AWS credentials were exercised.
+Commands and results (all empty = PASS):
+```
+grep -rn ',,}'  deploy-changeset.sh   -> none
+grep -rn '\^\^}' deploy-changeset.sh  -> none
+grep -rn 'huraisturkey' deploy-changeset.sh -> none
+```
+(Note: an earlier run matched `,,}` inside a code comment that spelled out the forbidden
+expansion; the comment was reworded so the literal pattern no longer appears anywhere.)
+
+README forbidden-word / hardcoded-repo scans (all empty = PASS):
+```
+grep -niE 'training|instructor|candidate|student|learner' README.md       -> none
+grep -nE  'huraisturkey-lang/Ai_Agent' README.md                          -> none
+```
+
+## 4. Project gate — `make prod-check`
+
+Command:
+```
+make prod-check
+```
+Result: **PASS**
+- `make check` — `python -m compileall` succeeded (no output errors).
+- `make test` — `Ran 127 tests in 1.745s` → `OK`.
+- `make smoke` — `POC/run_smoke.py` → `Smoke test completed successfully.`
+
+## 5. OIDC template verification (no change)
+
+`cloudformation-github-oidc.yml` already declares `GitHubOrg` / `GitHubRepo` params and the
+role trust `StringLike` uses `!Sub "repo:${GitHubOrg}/${GitHubRepo}:*"`. Passing
+`--parameter-overrides GitHubOrg=.. GitHubRepo=..` scopes the trust to the detected repo
+with no template edit. Thumbprint logic and role permission policies left untouched.
+
+## Summary
+
+All checks pass. `bash -n` clean; parse function correct for all four URL forms + fail-fast;
+no bash-4 constructs; no hardcoded author repo as a functional default; README free of the
+banned words and the hardcoded clone URL; `make prod-check` green (127 tests + smoke). No
+AWS/GitHub network calls were made.

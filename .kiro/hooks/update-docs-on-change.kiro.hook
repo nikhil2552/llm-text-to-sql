@@ -1,0 +1,21 @@
+{
+  "enabled": true,
+  "name": "Update Docs on Source Change",
+  "description": "When Python source files, config YAML, CloudFormation templates, Makefile, or Dockerfile are edited, ask the agent to review and update README.md or DEPLOYMENT.md to keep documentation in sync with the code.",
+  "version": "1",
+  "when": {
+    "type": "fileEdited",
+    "patterns": [
+      "**/*.py",
+      "config/**/*.yaml",
+      "cloudformation-*.yml",
+      "Makefile",
+      "Dockerfile",
+      "requirements.txt"
+    ]
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "A source file was just edited. Review the change and determine if README.md or DEPLOYMENT.md need to be updated to stay accurate. If the change affects documented behavior, APIs, configuration, setup steps, architecture, or deployment instructions, update the relevant documentation. Keep updates minimal and focused only on what changed. If no documentation update is needed, do nothing."
+  }
+}

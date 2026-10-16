@@ -815,12 +815,24 @@ A Lambda function fires on any file upload to the primary S3 bucket. It:
 3. If no Glue crawler exists → creates one (`project-{prefix}-crawler`)
 4. Starts the crawler → Glue discovers the schema → tables appear in Athena
 
+**Known vs. unknown prefixes.** The two known seed prefixes are pinned to the
+CloudFormation-managed names (CloudFormation is the single source of truth). For these,
+the Lambda starts the existing CFN crawler instead of creating a duplicate database/crawler:
+
+| Prefix | Database | Crawler |
+|--------|----------|---------|
+| `library-data/` | `project_library_db` | `project-library-crawler` |
+| `cars-data/` | `project_cars_db` | `project-cars-crawler` |
+
+Any other (unknown) prefix keeps the generic sanitize-based behavior above, creating the
+database and crawler on demand.
+
 ### Example
 
-Upload `s3://your-bucket/sales-data/2024.csv`:
-- Creates DB `project_sales_data_db`
-- Creates crawler `project-sales-data-crawler`
-- Crawler runs → creates table `sales_data` in Athena
+Upload `s3://your-bucket/sales/2024.csv` (unknown prefix):
+- Creates DB `project_sales_db`
+- Creates crawler `project-sales-crawler`
+- Crawler runs → creates table in Athena
 
 ### For pre-existing buckets
 

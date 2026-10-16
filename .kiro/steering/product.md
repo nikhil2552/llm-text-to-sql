@@ -1,6 +1,6 @@
 # Product Summary
 
-CloudAge Data Architecture with Generative AI — a Text-to-SQL service that converts natural language questions into SQL queries using LangChain and AWS Bedrock (Amazon Nova models).
+CloudAge Data Architecture with Generative AI — a Text-to-SQL service that converts natural language questions into SQL queries using AWS Bedrock (Amazon Nova models).
 
 ## Core Capabilities
 

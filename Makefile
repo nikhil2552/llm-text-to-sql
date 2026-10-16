@@ -12,6 +12,7 @@
 #   make ui          — Start the Streamlit chat UI
 #   make deploy      — Review mode: show what CloudFormation will change
 #   make deploy-all  — Full auto: deploy stack + build image + start service
+#   make teardown    — Destroy all AWS infrastructure
 #   make setup       — Create virtualenv and install dependencies
 #   make venv        — Same as setup (ensure .venv exists)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -24,21 +25,21 @@ VENV_PYTHON := $(VENV)/bin/python3
 
 # Create virtual environment and install dependencies
 venv:
-	@test -d $(VENV) || $(PYTHON) -m venv $(VENV)
+	@test -x $(VENV_PYTHON) || $(PYTHON) -m venv --clear $(VENV)
 	$(VENV_PYTHON) -m pip install -q --upgrade pip
 	$(VENV_PYTHON) -m pip install -q -r requirements-dev.txt
 
 # Compile-check all Python code (catches syntax errors fast)
 check:
-	$(PYTHON) -m compileall src scripts lambda run_smoke.py
+	$(PYTHON) -m compileall src scripts lambda POC/run_smoke.py
 
 # Run unit tests
-test:
-	PYTHONPATH=src $(PYTHON) -m unittest discover -s tests -p "test_*.py" -v
+test: venv
+	PYTHONPATH=src $(VENV_PYTHON) -m unittest discover -s tests -p "test_*.py" -v
 
 # Run smoke test — loads local data, no AWS calls
 smoke:
-	$(PYTHON) run_smoke.py
+	$(PYTHON) POC/run_smoke.py
 
 # Full production gate: compile + test + smoke (used by CI)
 prod-check: check test smoke

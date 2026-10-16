@@ -93,10 +93,11 @@ def create_athena_engine(
 
 
 class AthenaDB:
-    """Execute SQL via PyAthena without LangChain metadata introspection.
+    """Minimal SQL executor over a PyAthena SQLAlchemy engine.
 
-    LangChain's SQLDatabase calls athena:ListTableMetadata on init. We already
-    load schema from Glue in parse_catalog(), so only run() is needed.
+    Avoids any ORM/metadata introspection on init (e.g. athena:ListTableMetadata).
+    The schema is already loaded from Glue in parse_catalog(), so only run() is
+    needed to execute a validated, read-only query and return rows.
     """
 
     def __init__(self, engine):

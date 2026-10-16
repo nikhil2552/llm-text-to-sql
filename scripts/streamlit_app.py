@@ -43,6 +43,7 @@ from llm_sql.connectors.registry import (
     list_connections,
     load_connections,
 )
+from llm_sql.connectors.auto_populate import AutoPopulateOrchestrator
 from scripts.sidebar_helpers import (
     CONNECTOR_ORDER,
     CONNECTOR_ICONS,
@@ -1064,11 +1065,78 @@ def _check_and_show_unconfigured_banner(connector_type: str) -> None:
         st.session_state['config_form_expanded'] = True
 
 
+def _friendly_connector_name(connector_type: str) -> str:
+    """Return a user-friendly display name for a connector type."""
+    names = {
+        "athena": "Athena",
+        "rds_mysql": "RDS Aurora MySQL",
+        "redshift": "Redshift Serverless",
+    }
+    return names.get(connector_type, connector_type)
+
+
+def _run_auto_detect():
+    """Run auto-detection and display results in the sidebar."""
+    orchestrator = AutoPopulateOrchestrator(config_dir=_CONFIG_DIR)
+    with st.spinner("Scanning CloudFormation stacks..."):
+        results = orchestrator.run()
+
+    created = [r for r in results if r.action == 'created']
+    skipped = [r for r in results if r.action == 'skipped']
+    unavailable = [r for r in results if r.action == 'unavailable']
+    errors = [r for r in results if r.action == 'error']
+
+    if created:
+        names = ', '.join(_friendly_connector_name(r.connector_type) for r in created)
+        st.success(f"✓ Configured: {names}")
+    if skipped:
+        names = ', '.join(_friendly_connector_name(r.connector_type) for r in skipped)
+        st.info(f"Already configured: {names}")
+    if unavailable:
+        names = ', '.join(_friendly_connector_name(r.connector_type) for r in unavailable)
+        st.caption(f"Not deployed: {names}")
+    if errors:
+        for e in errors:
+            st.error(f"Detection failed: {e.reason}")
+    if not created and not skipped and not errors and not unavailable:
+        st.caption("No stacks found in this region.")
+
+    if created:
+        st.rerun()
+
+
 def _render_sidebar():
     """Render sidebar with CloudAge logo and connection info."""
     logo_uri = _get_logo_b64()
 
     with st.sidebar:
+        # ── Startup auto-detection (runs once per session) ──
+        if 'auto_detect_ran' not in st.session_state:
+            st.session_state['auto_detect_ran'] = True
+            orchestrator = AutoPopulateOrchestrator(config_dir=_CONFIG_DIR)
+            if orchestrator.should_auto_run():
+                try:
+                    results = orchestrator.run()
+                    created = [r for r in results if r.action == 'created']
+                    if created:
+                        st.session_state['auto_detect_results'] = results
+                        st.rerun()
+                except Exception as e:
+                    st.session_state['auto_detect_error'] = str(e)
+
+        # Show auto-detect results banner (from startup detection)
+        if 'auto_detect_results' in st.session_state:
+            results = st.session_state.pop('auto_detect_results')
+            created = [r for r in results if r.action == 'created']
+            if created:
+                names = ', '.join(_friendly_connector_name(r.connector_type) for r in created)
+                st.success(f"✓ Auto-configured: {names}")
+
+        # Show auto-detect error (from startup detection)
+        if 'auto_detect_error' in st.session_state:
+            error_msg = st.session_state.pop('auto_detect_error')
+            st.warning(f"Could not auto-detect connections: {error_msg}")
+
         # Logo
         if logo_uri:
             st.markdown(
@@ -1202,6 +1270,10 @@ def _render_sidebar():
         _render_config_form(selected_type)
         _render_connection_tester(selected_type)
         _check_and_show_unconfigured_banner(selected_type)
+
+        # Auto-detect button (subtle, below connector cards)
+        if st.button("⚡ Auto-detect from CloudFormation", key="auto_detect_btn", use_container_width=True):
+            _run_auto_detect()
 
         # Backward compatibility: update active_source from active_connector_type
         st.session_state['active_source'] = st.session_state.get('active_connector_type', 'athena')

@@ -7,9 +7,6 @@ boto3>=1.35.0,<2.0
 pyathena>=3.10,<4.0
 pymysql>=1.1.0,<2.0
 psycopg2-binary>=2.9.9,<3.0
-langchain>=0.2,<0.4
-langchain-community>=0.2,<0.4
-langchain-experimental>=0.0.60,<0.1
 requests>=2.31.0,<3.0
 pydantic>=1.10.0,<3.0
 pydantic-settings>=2.0.0,<3.0; python_version >= "3.8"
@@ -25,3 +22,13 @@ streamlit>=1.32.0,<2.0
 redshift-connector>=2.1.0,<3.0
 snowflake-connector-python>=3.6.0,<4.0
 databricks-sql-connector>=3.1.0,<4.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POC-only (NOT used by the runtime service)
+# The text-to-SQL service calls AWS Bedrock directly via boto3 (see
+# src/llm_sql/core.py). LangChain is kept only for the notebooks in POC/.
+# Safe to remove if you don't run those notebooks.
+# ─────────────────────────────────────────────────────────────────────────────
+langchain>=0.2,<0.4
+langchain-community>=0.2,<0.4
+langchain-experimental>=0.0.60,<0.1

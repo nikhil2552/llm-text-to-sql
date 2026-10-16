@@ -50,7 +50,7 @@ class AthenaConnector(BaseConnector):
         service = self._get_service()
         result = service.db.run(sql)
         if isinstance(result, str):
-            # LangChain SQLDatabase.run() returns a string representation
+            # Defensive: wrap a scalar/string result into the row-dict shape
             return [{'result': result}]
         return result
 

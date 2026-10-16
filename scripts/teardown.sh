@@ -14,6 +14,8 @@
 #   6. Deletes Athena workgroup
 #   7. Deletes Glue crawlers and databases
 #   8. Deletes CloudWatch log groups
+#   9. Force-deletes stack-managed Secrets Manager secrets (no 30-day recovery
+#      window), so a later redeploy can recreate them under the same names.
 #
 # After teardown, NOTHING remains - clean slate for redeployment.
 set -euo pipefail
@@ -21,6 +23,7 @@ set -euo pipefail
 REGION="${AWS_REGION:-eu-north-1}"
 MAIN_STACK="cgs-ai-analyst-agent-project"
 RDS_STACK="cgs-ai-rds-aurora"
+REDSHIFT_STACK="cgs-ai-redshift-serverless"
 ECR_REPO="data-architecture-ai"
 FORCE=false
 
@@ -36,6 +39,7 @@ echo "=========================================="
 echo "Region:     $REGION"
 echo "Main stack: $MAIN_STACK"
 echo "RDS stack:  $RDS_STACK"
+echo "Redshift:   $REDSHIFT_STACK"
 echo ""
 
 # ── Check what exists ──────────────────────────────────────────────────────
@@ -51,11 +55,18 @@ RDS_STATUS="$(aws cloudformation describe-stacks \
   --query 'Stacks[0].StackStatus' \
   --output text 2>/dev/null || echo 'NOT_FOUND')"
 
-echo "Main stack status: $MAIN_STATUS"
-echo "RDS stack status:  $RDS_STATUS"
+REDSHIFT_STATUS="$(aws cloudformation describe-stacks \
+  --stack-name "$REDSHIFT_STACK" \
+  --region "$REGION" \
+  --query 'Stacks[0].StackStatus' \
+  --output text 2>/dev/null || echo 'NOT_FOUND')"
+
+echo "Main stack status:     $MAIN_STATUS"
+echo "RDS stack status:      $RDS_STATUS"
+echo "Redshift stack status: $REDSHIFT_STATUS"
 echo ""
 
-if [[ "$MAIN_STATUS" == "NOT_FOUND" && "$RDS_STATUS" == "NOT_FOUND" ]]; then
+if [[ "$MAIN_STATUS" == "NOT_FOUND" && "$RDS_STATUS" == "NOT_FOUND" && "$REDSHIFT_STATUS" == "NOT_FOUND" ]]; then
   echo "Nothing to tear down - no stacks found."
   exit 0
 fi
@@ -72,6 +83,7 @@ if ! $FORCE; then
   echo "   - Athena workgroup"
   echo "   - Glue crawlers and databases"
   echo "   - CloudWatch log groups"
+  echo "   - Secrets Manager secrets (streamlit / aurora / redshift credentials)"
   if [[ "$RDS_STATUS" != "NOT_FOUND" ]]; then
     echo "   - Aurora database (final snapshot will be taken)"
   fi
@@ -117,6 +129,20 @@ if [[ "$RDS_STATUS" != "NOT_FOUND" && "$RDS_STATUS" != "DELETE_COMPLETE" ]]; the
   echo "✓ RDS stack deleted"
 fi
 
+# ── Step 2b: Delete Redshift stack (if exists) ─────────────────────────────
+if [[ "$REDSHIFT_STATUS" != "NOT_FOUND" && "$REDSHIFT_STATUS" != "DELETE_COMPLETE" ]]; then
+  echo ""
+  echo "Deleting Redshift stack ($REDSHIFT_STACK)..."
+  aws cloudformation delete-stack \
+    --stack-name "$REDSHIFT_STACK" \
+    --region "$REGION"
+  echo "  Waiting for Redshift deletion..."
+  aws cloudformation wait stack-delete-complete \
+    --stack-name "$REDSHIFT_STACK" \
+    --region "$REGION" 2>/dev/null || true
+  echo "✓ Redshift stack deleted"
+fi
+
 # ── Step 3: Delete main stack ──────────────────────────────────────────────
 if [[ "$MAIN_STATUS" != "NOT_FOUND" && "$MAIN_STATUS" != "DELETE_COMPLETE" ]]; then
   echo ""
@@ -131,31 +157,37 @@ if [[ "$MAIN_STATUS" != "NOT_FOUND" && "$MAIN_STATUS" != "DELETE_COMPLETE" ]]; t
   echo "✓ Main stack deleted"
 fi
 
-# ── Step 4: Clean up ECR images ────────────────────────────────────────────
+# ── Step 4: Clean up ECR images and repository ────────────────────────────
 echo ""
 echo "Cleaning up ECR repository..."
 if aws ecr describe-repositories --repository-names "$ECR_REPO" --region "$REGION" >/dev/null 2>&1; then
-  IMAGE_IDS="$(aws ecr list-images \
-    --repository-name "$ECR_REPO" \
-    --region "$REGION" \
-    --query 'imageIds[*]' \
-    --output json 2>/dev/null || echo '[]')"
-  if [[ "$IMAGE_IDS" != "[]" && "$IMAGE_IDS" != "" ]]; then
-    aws ecr batch-delete-image \
-      --repository-name "$ECR_REPO" \
-      --image-ids "$IMAGE_IDS" \
-      --region "$REGION" >/dev/null 2>&1 || true
-    echo "✓ ECR images deleted"
-  else
-    echo "  No images to delete"
-  fi
+  # --force deletes all images AND the repository in one call
   aws ecr delete-repository \
     --repository-name "$ECR_REPO" \
     --region "$REGION" \
-    --force >/dev/null 2>&1 || true
-  echo "✓ ECR repository deleted"
+    --force >/dev/null 2>&1
+  echo "✓ ECR repository '$ECR_REPO' deleted (including all images)"
 else
-  echo "  ECR repository not found (already deleted by stack)"
+  echo "  ECR repository not found (already deleted)"
+fi
+
+# ── Step 4b: Delete GitHub OIDC stack ──────────────────────────────────────
+OIDC_STACK="github-actions-oidc"
+OIDC_STATUS="$(aws cloudformation describe-stacks \
+  --stack-name "$OIDC_STACK" \
+  --region "$REGION" \
+  --query 'Stacks[0].StackStatus' \
+  --output text 2>/dev/null || echo 'NOT_FOUND')"
+if [[ "$OIDC_STATUS" != "NOT_FOUND" && "$OIDC_STATUS" != "DELETE_COMPLETE" ]]; then
+  echo ""
+  echo "Deleting GitHub OIDC stack..."
+  aws cloudformation delete-stack \
+    --stack-name "$OIDC_STACK" \
+    --region "$REGION"
+  aws cloudformation wait stack-delete-complete \
+    --stack-name "$OIDC_STACK" \
+    --region "$REGION" 2>/dev/null || true
+  echo "✓ OIDC stack deleted"
 fi
 
 # ── Step 5: Delete S3 data buckets ─────────────────────────────────────────
@@ -191,9 +223,25 @@ echo ""
 echo "Cleaning up Athena workgroup..."
 WORKGROUP="project-text-to-sql"
 if aws athena get-work-group --work-group "$WORKGROUP" --region "$REGION" >/dev/null 2>&1; then
+  # Delete any named queries in the workgroup first
+  NAMED_QUERIES="$(aws athena list-named-queries \
+    --work-group "$WORKGROUP" \
+    --region "$REGION" \
+    --query 'NamedQueryIds' \
+    --output text 2>/dev/null || echo '')"
+  if [[ -n "$NAMED_QUERIES" ]]; then
+    for QID in $NAMED_QUERIES; do
+      aws athena delete-named-query --named-query-id "$QID" --region "$REGION" 2>/dev/null || true
+    done
+  fi
+  # Delete the workgroup with recursive option (removes saved queries and history)
   aws athena delete-work-group \
     --work-group "$WORKGROUP" \
     --recursive-delete-option \
+    --region "$REGION" 2>/dev/null || \
+  # Retry without recursive if flag not supported in this CLI version
+  aws athena delete-work-group \
+    --work-group "$WORKGROUP" \
     --region "$REGION" 2>/dev/null || true
   echo "✓ Athena workgroup '$WORKGROUP' deleted"
 else
@@ -203,24 +251,33 @@ fi
 # ── Step 7: Delete Glue crawlers and databases ─────────────────────────────
 echo ""
 echo "Cleaning up Glue crawlers..."
-for CRAWLER_NAME in project-library-crawler project-cars-crawler; do
-  if aws glue get-crawler --name "$CRAWLER_NAME" --region "$REGION" >/dev/null 2>&1; then
+# Delete all project crawlers (including auto-created ones by Lambda)
+ALL_CRAWLERS="$(aws glue list-crawlers --region "$REGION" \
+  --query "CrawlerNames[?starts_with(@, 'project-')]" \
+  --output text 2>/dev/null || echo '')"
+if [[ -n "$ALL_CRAWLERS" ]]; then
+  for CRAWLER_NAME in $ALL_CRAWLERS; do
+    aws glue stop-crawler --name "$CRAWLER_NAME" --region "$REGION" 2>/dev/null || true
     aws glue delete-crawler --name "$CRAWLER_NAME" --region "$REGION" 2>/dev/null || true
     echo "  ✓ Crawler '$CRAWLER_NAME' deleted"
-  else
-    echo "  $CRAWLER_NAME not found - skipping"
-  fi
-done
+  done
+else
+  echo "  No project crawlers found"
+fi
 
 echo "Cleaning up Glue databases..."
-for DB_NAME in project_library_db project_cars_db; do
-  if aws glue get-database --name "$DB_NAME" --region "$REGION" >/dev/null 2>&1; then
+# Delete all project_ prefixed databases (includes auto-created ones by Lambda)
+ALL_GLUE_DBS="$(aws glue get-databases --region "$REGION" \
+  --query "DatabaseList[?starts_with(Name, 'project_')].Name" \
+  --output text 2>/dev/null || echo '')"
+if [[ -n "$ALL_GLUE_DBS" ]]; then
+  for DB_NAME in $ALL_GLUE_DBS; do
     aws glue delete-database --name "$DB_NAME" --region "$REGION" 2>/dev/null || true
     echo "  ✓ Glue database '$DB_NAME' deleted"
-  else
-    echo "  $DB_NAME not found - skipping"
-  fi
-done
+  done
+else
+  echo "  No project Glue databases found"
+fi
 
 # ── Step 8: Delete CloudWatch log groups ───────────────────────────────────
 echo ""
@@ -232,6 +289,29 @@ for LOG_GROUP in "/ecs/data-architecture-ai" "/ecs/data-architecture-ai-streamli
     echo "  ✓ Log group '$LOG_GROUP' deleted"
   else
     echo "  $LOG_GROUP not found - skipping"
+  fi
+done
+
+# ── Step 9: Force-delete stack-managed Secrets Manager secrets ─────────────
+# Deleting a CloudFormation stack schedules its AWS::SecretsManager::Secret
+# resources for deletion with a 30-day recovery window rather than removing
+# them immediately. That leaves the secret "marked for deletion", which blocks
+# a later redeploy from recreating a secret with the same name. Force-delete
+# them here (no recovery window) for a true clean slate.
+echo ""
+echo "Cleaning up Secrets Manager secrets..."
+for SECRET in \
+  "cgs-ai-analyst-agent/streamlit-credentials" \
+  "cgs-ai-rds-aurora/aurora-credentials" \
+  "cgs-ai-redshift-serverless/redshift-credentials"; do
+  if aws secretsmanager describe-secret --secret-id "$SECRET" --region "$REGION" >/dev/null 2>&1; then
+    aws secretsmanager delete-secret \
+      --secret-id "$SECRET" \
+      --force-delete-without-recovery \
+      --region "$REGION" >/dev/null 2>&1 || true
+    echo "  ✓ Secret '$SECRET' deleted (no recovery window)"
+  else
+    echo "  $SECRET not found - skipping"
   fi
 done
 

@@ -6,7 +6,7 @@
 │   ├── __init__.py           # Exports LLMSQLService, parse_catalog
 │   ├── api.py                # FastAPI HTTP API (/health, /query)
 │   ├── config.py             # Pydantic settings (env vars, validation)
-│   ├── core.py               # LLMSQLService — LangChain text-to-SQL logic
+│   ├── core.py               # LLMSQLService — Bedrock text-to-SQL logic (direct boto3)
 │   ├── runner.py             # Service builder (wires Athena connector + LLM)
 │   ├── secrets.py            # Secrets Manager integration
 │   └── connectors/           # Multi-connector framework
